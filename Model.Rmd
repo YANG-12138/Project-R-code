@@ -1,0 +1,421 @@
+---
+title: "Bayesian Bradley-Terry"
+author: "George Kinnear"
+date: "04/10/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(bpcs)
+library(tidyverse)
+library(knitr)
+library(posterior)
+library(bayesplot)
+library(igraph)
+set.seed(99)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+judgements_raw <- read.csv("judgement_data.csv") %>%  
+  filter(study == "study2", dimension == "rigour") %>% 
+  mutate(winner = 0)
+
+# the raw data has cryptic ID numbers for the proofs
+item_names <- tibble::tribble(
+  ~id, ~ItemName,
+            112L,  "Proof1",
+            157L, "Proof10",
+            162L, "Proof11",
+            167L, "Proof12",
+            172L, "Proof13",
+            177L, "Proof14",
+            182L, "Proof15",
+            117L,  "Proof2",
+            122L,  "Proof3",
+            127L,  "Proof4",
+            132L,  "Proof5",
+            137L,  "Proof6",
+            142L,  "Proof7",
+            147L,  "Proof8",
+            152L,  "Proof9"
+  )
+
+# here we replace the cryptic numbers with the proof names
+judgements <- judgements_raw %>% 
+  left_join(item_names %>% rename(item_won = ItemName), by = c("Won" = "id")) %>% 
+  left_join(item_names %>% rename(item_lost = ItemName), by = c("Lost" = "id")) %>% 
+  select(-Won, -Lost) %>% 
+  rename(Won = item_won, Lost = item_lost)
+
+```
+
+```{r}
+if(file.exists("fittedmodels/study2rigour.RDS")) {
+  m <- load_bpc_model('fittedmodels/study2rigour.RDS')
+} else {
+  m <- bpc(data = judgements,
+           player0 = 'Won',
+           player1 = 'Lost',
+           result_column = 'winner',
+           solve_ties = 'none',
+           model_type = 'bt',
+           iter=3000,
+           show_chain_messages = T)
+  save_bpc_model(m, 'study2rigour','./fittedmodels')
+}
+```
+```{r eval=FALSE, include=FALSE}
+y_pp <- posterior_predictive(m)
+y <- y_pp$y
+y_pred <- y_pp$y_pred
+launch_shinystan(m)
+```
+
+```{r}
+check_convergence_diagnostics(m)
+```
+
+```{r}
+draws<- m$fit$draws(variables = c('lambda'))
+mcmc_trace(posterior::as_draws(draws)) + 
+  labs(title="Traceplots")
+```
+
+```{r}
+x<-summary(m)
+```
+
+```{r}
+get_parameters_table(m, format='html', caption = 'Parameter estimates with HPDI', digits = 3)
+```
+
+```{r}
+get_probabilities_table(m, format='html', caption='Probability of selecting one proof over another')
+```
+
+```{r}
+get_rank_of_players_table(m, caption='Rank of Proofs', format='html')
+```
+
+```{r}
+plot(m, rotate_x_labels=T)
+```
+# Beyesian BTM
+```{r}
+bpcs_parameters <- get_parameters_df(m)
+```
+
+```{r}
+beysian_btm_scores <- bpcs_parameters %>%
+  transmute(
+    item = str_extract(Parameter, "\\[(.*)\\]") %>% str_remove("\\[")
+%>% str_remove("\\]"),
+    beysian_btm_score = Mean
+  )
+
+beysian_btm_scores
+```
+
+# Traditional Bradley-Terry approach
+
+```{r}
+library(sirt)
+
+decisions_for_sirt <- judgements %>%
+    select(chosen = Won, notChosen = Lost) %>%
+    mutate(winner = 1) %>% # indicate to sirt::btm that the winner is the leftmost column
+    data.frame
+
+ mdl <- sirt::btm(decisions_for_sirt,
+                   # include judge details so that sirt::btm computes judge infit
+                   judge = judgements %>% pull(JudgeID),
+                   maxit=400,
+                   fix.eta=0, # the "home advantage" should be 0 as left column does not mean home
+                   ignore.ties=TRUE)
+ 
+ judge_fits <- mdl[["fit_judges"]] %>%
+    transmute(JudgeID = as.character(judge), infit) %>%
+    mutate(
+      infit_mean = mean(infit),
+      infit_sd = sd(infit),
+      # note which judges have an infit value more than 2sd above the mean
+      discard = infit > infit_mean + 2*infit_sd
+    ) %>%
+    select(JudgeID, contains("infit"), discard)
+ 
+ sirt_info <- tibble(
+    N_R = nrow(mdl[["effects"]]),
+    N_A = nrow(judge_fits),
+    N_C = nrow(decisions_for_sirt),
+    ssr = mdl$mle.rel
+  )
+ 
+btm_estimates <- as_tibble(mdl[["effects"]])
+```
+
+```{r}
+sirt_info
+```
+
+```{r}
+btm_estimates %>% 
+  select(individual, starts_with("N"), theta, se.theta)
+```
+
+
+# Elochoice
+```{r}
+library(EloChoice) 
+set.seed(123)
+res <- elochoice(winner = judgements$Won, loser= judgements$Lost, runs = 1000)
+summary(res)
+
+```
+
+```{r}
+ratings(res, show = "original", drawplot = FALSE)
+
+```
+
+
+```{r}
+ratings(res, show = "mean", drawplot = FALSE)
+```
+
+
+```{r}
+myratings <- ratings(res, show = "mean", drawplot = FALSE)
+elo_scores <- myratings %>% enframe() %>% select(item = name, elo_score = value)
+```
+
+
+#pagerank
+```{r}
+library(igraph)
+```
+
+```{r}
+edges <- judgements %>% 
+  select(Won, Lost)
+
+graph <- graph_from_edgelist(as.matrix(edges))
+graph
+vcount(graph)
+V(graph)
+```
+
+```{r}
+page_rank_output <- page_rank(
+  graph,
+  algo = c("prpack", "arpack"),
+  vids = V(graph),
+  directed = TRUE,
+  damping = 0.85,
+  personalized = NULL,
+  weights = NULL,
+  options = NULL
+)
+
+page_rank <- page_rank_output$vector %>% enframe()
+
+page_rank 
+```
+```{r}
+library(dplyr)
+pagerank <- page_rank %>%
+  select(item = name, page_rank_score = value)
+pagerank
+```
+
+
+# Comparatable Table
+
+```{r}
+library(dplyr)
+```
+
+```{r}
+all_results1 <- btm_estimates %>%
+  select(item = individual, btm_score = theta) %>%
+  left_join(beysian_btm_scores, by = "item") %>% 
+  left_join(elo_scores, by = "item")
+  
+all_results1
+
+```
+
+```{r}
+all_results2 <- page_rank %>%
+  select(item = name, page_rank_score = value) %>%
+  left_join(all_results1, by = "item") 
+ 
+  
+all_results2 
+```
+
+
+# Correlation graph
+```{r}
+
+library(datasets)
+iris <- all_results2 
+data <- iris[, 2:5] # Numerical variables
+groups <- iris[, 1] # Factor variable (groups)
+
+# Plot correlation matrix
+pairs(data)
+
+```
+```{r}
+# Function to add histograms
+panel.hist <- function(x, ...) {
+    usr <- par("usr")
+    on.exit(par(usr))
+    par(usr = c(usr[1:2], 0, 1.5))
+    his <- hist(x, plot = FALSE)
+    breaks <- his$breaks
+    nB <- length(breaks)
+    y <- his$counts
+    y <- y/max(y)
+    rect(breaks[-nB], 0, breaks[-1], y, col = rgb(0, 1, 1, alpha = 0.5), ...)
+    # lines(density(x), col = 2, lwd = 2) # Uncomment to add density lines
+}
+
+# Creating the scatter plot matrix
+pairs(data,
+      upper.panel = NULL,         # Disabling the upper panel
+      diag.panel = panel.hist)    # Adding the histograms
+```
+```{r}
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+    usr <- par("usr")
+    on.exit(par(usr))
+    par(usr = c(0, 1, 0, 1))
+    Cor <- abs(cor(x, y)) # Remove abs function if desired
+    txt <- paste0(prefix, format(c(Cor, 0.123456789), digits = digits)[1])
+    if(missing(cex.cor)) {
+        cex.cor <- 0.4 / strwidth(txt)
+    }
+    text(0.5, 0.5, txt,
+         cex = 1 + cex.cor * Cor) # Resize the text by level of correlation
+}
+
+# Plotting the correlation matrix
+pairs(data,
+      upper.panel = panel.cor,    # Correlation panel
+      lower.panel = panel.smooth) # Smoothed regression lines
+```
+```{r}
+# install.packages("gclus")
+library(gclus)
+
+# Correlation in absolute terms
+corr <- abs(cor(data)) 
+
+colors <- dmat.color(corr)
+order <- order.single(corr)
+install.packages("psych")
+cpairs(data,                    # Data frame of variables
+       order,                   # Order of the variables
+       panel.colors = colors,   # Matrix of panel colors
+       border.color = "grey70", # Borders color
+       gap = 0.45,              # Distance between subplots
+       main = "Ordered variables colored by correlation", # Main title
+       show.points = TRUE,      # If FALSE, removes all the points
+       pch = 21,                # pch symbol
+       bg = rainbow(3)[iris$Species]) # Colors by groupi
+```
+```{r}
+library(psych)
+
+pairs.panels(data,
+             smooth = TRUE,      # If TRUE, draws loess smooths
+             scale = FALSE,      # If TRUE, scales the correlation text font
+             density = TRUE,     # If TRUE, adds density plots and histograms
+             ellipses = TRUE,    # If TRUE, draws ellipses
+             method = "pearson", # Correlation method (also "spearman" or "kendall")
+             pch = 21,           # pch symbol
+             lm = FALSE,         # If TRUE, plots linear fit rather than the LOESS (smoothed) fit
+             cor = TRUE,         # If TRUE, reports correlations
+             jiggle = FALSE,     # If TRUE, data points are jittered
+             factor = 2,         # Jittering factor
+             hist.col = 4,       # Histograms color
+             stars = TRUE,       # If TRUE, adds significance level with stars
+             ci = TRUE)          # If TRUE, adds confidence intervals
+```
+
+```{r}
+library(corrplot)
+
+corrplot(cor(data),        # Correlation matrix
+         method = "shade", # Correlation plot method
+         type = "full",    # Correlation plot style (also "upper" and "lower")
+         diag = TRUE,      # If TRUE (default), adds the diagonal
+         tl.col = "black", # Labels color
+         bg = "white",     # Background color
+         title = "",       # Main title
+         col = NULL)       # Color palette
+par(mfrow = c(2, 3))
+
+# Circles
+corrplot(cor(data), method = "circle",
+        title = "method = 'circle'",
+        tl.pos = "n", mar = c(2, 1, 3, 1)) 
+# Squares 
+corrplot(cor(data), method = "square",
+        title = "method = 'square'",
+        tl.pos = "n", mar = c(2, 1, 3, 1)) 
+# Ellipses
+corrplot(cor(data), method = "ellipse",
+         title = "method = 'ellipse'",
+         tl.pos = "n", mar = c(2, 1, 3, 1)) 
+# Correlations
+corrplot(cor(data), method = "number",
+         title = "method = 'number'",
+         tl.pos = "n", mar = c(2, 1, 3, 1)) 
+# Pie charts
+corrplot(cor(data), method = "pie",
+         title = "method = 'pie'",
+         tl.pos = "n", mar = c(2, 1, 3, 1)) 
+# Colors
+corrplot(cor(data), method = "color",
+         title = "method = 'color'",
+         tl.pos = "n", mar = c(2, 1, 3, 1)) 
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+corrplot(cor(data),
+         method = "circle",       
+         order = "hclust",         # Ordering method of the matrix
+         hclust.method = "ward.D", # If order = "hclust", is the cluster method to be used
+         addrect = 2,              # If order = "hclust", number of cluster rectangles
+         rect.col = 3,             # Color of the rectangles
+         rect.lwd = 3)             # Line width of the rectangles
+
+corrplot.mixed(cor(data),
+               lower = "number", 
+               upper = "circle",
+               tl.col = "black")
+```
+```{r}
+# Comparatable Table
+all_results <- btm_estimates %>%
+  select(item = individual, btm_score = theta) %>%
+  left_join(beysian_btm_scores, by = "item") %>% 
+  left_join(elo_scores, by = "item")
+  
+
+
+all_results
+```
+
+```{r}
+scores_to_compare %>% 
+  ggplot(aes(x = traditional_btm, y = elo_score)) +
+  geom_point()
+# TODO: compute the correlation coefficient
+```
+
